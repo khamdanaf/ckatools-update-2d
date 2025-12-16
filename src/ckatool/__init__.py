@@ -44,15 +44,82 @@ def main() -> int:
 
     return 0
 
+RAWPATHS_COLS = {
+    "Player", "Level", "Pair_Label", "From", "To", "Seq", "X", "Y", "Timestamp"
+}
+
+def _convert_rawpaths_to_ckatool_df(df: pl.DataFrame, tail_n: int = 5) -> pl.DataFrame:
+    scale = 0.01      # kalau gerak kekecilan: 0.05 ; kalau terlalu besar: 0.001
+    iter_gap = 2.0    # detik jeda antar iteration biar timeline tidak tumpang tindih
+
+    df2 = (
+        df.with_columns(
+            pl.col("Seq").cast(pl.Int32).alias("iteration"),
+            pl.col("Timestamp").cast(pl.Float64).alias("timestamp"),
+            # center + scale (biar objek dekat origin & kelihatan)
+            ((pl.col("X").cast(pl.Float64) - pl.col("X").mean()) * scale).alias("end_effector_x"),
+            ((-(pl.col("Y").cast(pl.Float64) - pl.col("Y").mean())) * scale).alias("end_effector_y"),
+            pl.lit(0.0).alias("end_effector_z"),
+        )
+        .select(["iteration", "timestamp", "end_effector_x", "end_effector_y", "end_effector_z"])
+        .sort(["iteration", "timestamp"])
+        .with_columns(
+            # timestamp mulai dari 0 per iteration + digeser agar antar iteration tidak numpuk
+            (
+                (pl.col("timestamp") - pl.col("timestamp").min().over("iteration"))
+                + (pl.col("iteration") - 1) * iter_gap
+            ).alias("timestamp")
+        )
+    )
+
+    targets = (
+        df2.group_by("iteration")
+        .agg(
+            pl.col("end_effector_x").tail(tail_n).mean().alias("target_x"),
+            pl.col("end_effector_y").tail(tail_n).mean().alias("target_y"),
+        )
+        .with_columns(pl.lit(0.0).alias("target_z"))
+    )
+    df2 = df2.join(targets, on="iteration", how="left")
+
+    # joint dummy (offset) -> ikut diskalakan biar proporsional
+    shoulder_dx, shoulder_dy = -120.0 * scale, -40.0 * scale
+    elbow_dx, elbow_dy = -60.0 * scale, -20.0 * scale
+    neck_dx, neck_dy = -115.0 * scale, -120.0 * scale
+    hip_dx, hip_dy = -130.0 * scale, 80.0 * scale
+
+    def pt(prefix: str, dx: float, dy: float) -> list[pl.Expr]:
+        return [
+            (pl.col("end_effector_x") + dx).alias(f"{prefix}_x"),
+            (pl.col("end_effector_y") + dy).alias(f"{prefix}_y"),
+            pl.lit(0.0).alias(f"{prefix}_z"),
+        ]
+
+    return df2.with_columns(
+        *pt("left_shoulder", shoulder_dx, shoulder_dy),
+        *pt("right_shoulder", shoulder_dx, shoulder_dy),
+        *pt("left_elbow", elbow_dx, elbow_dy),
+        *pt("right_elbow", elbow_dx, elbow_dy),
+        *pt("left_wrist", 0.0, 0.0),
+        *pt("right_wrist", 0.0, 0.0),
+        *pt("neck", neck_dx, neck_dy),
+        *pt("hip", hip_dx, hip_dy),
+    )
+
+
+def _read_input_flexible(input_file: str) -> pl.DataFrame:
+    df = pl.read_csv(input_file)
+    if RAWPATHS_COLS.issubset(set(df.columns)):
+        return _convert_rawpaths_to_ckatool_df(df, tail_n=5)
+    # kalau sudah format asli CKATool
+    return pl.read_csv(input_file, schema_overrides={"iteration": pl.Int32})
+
+
 
 class Visualiser:
     def __init__(self, input_file: str):
-        self._df = pl.read_csv(
-            input_file,
-            schema_overrides={
-                "iteration": pl.Int32,
-            },
-        )
+        self._df = _read_input_flexible(input_file)
+
 
     def process(self):
         ts = self._df["timestamp"]
@@ -200,14 +267,40 @@ class Visualiser:
             target.visualise_3d_data()
         if end_effector:
             end_effector.visualise_3d_data()
+
+            # === DOT bergerak di Trajectory ===
+            dfm = self._df.select(
+                ["timestamp", "end_effector_x", "end_effector_y", "end_effector_z"]
+            ).sort("timestamp")
+
+            pts = np.stack(
+                [
+                    dfm["end_effector_x"].to_numpy(),
+                    dfm["end_effector_y"].to_numpy(),
+                    dfm["end_effector_z"].to_numpy(),
+                ],
+                axis=1,
+            ).astype(np.float32)
+
+            step = 1  # kalau berat/lemot, coba 2 / 5 / 10
+
+            for i in range(0, len(pts), step):
+                rr.set_time_sequence("frame", i)  # bikin animasi frame-by-frame
+                rr.log("trajectory/dot", rr.Points3D(pts[i : i + 1], radii=0.05))
+            # === END DOT bergerak ===
+
             end_effector.calculate_target_error_distance(target)
             end_effector.calculate_hand_path_ratio(target)
             visualise_barchart_per_iteration(
-                end_effector.target_error_distance, ts, iteration, "target_error_distance", "", end_effector.object_name
+                end_effector.target_error_distance, ts, iteration,
+                "target_error_distance", "", end_effector.object_name
             )
             visualise_barchart_per_iteration(
-                end_effector.hand_path_ratio, ts, iteration, "hand_path_ratio", "", end_effector.object_name
+                end_effector.hand_path_ratio, ts, iteration,
+                "hand_path_ratio", "", end_effector.object_name
             )
+
+
 
         visualise_max_angle(
             right_shoulder,

@@ -6,90 +6,74 @@ import numpy as np
 
 
 def sampling_frequency_from_timestamp(timestamps: np.ndarray) -> float:
-    # Calculate sampling frequency from timestamps
-    diffs = np.diff(timestamps)
-    mean_dt = np.mean(diffs)
-    fs = 1.0 / mean_dt  # Sampling frequency
+    timestamps = np.asarray(timestamps, dtype=float)
+    if timestamps.size < 2:
+        return float("nan")
 
-    return fs
+    diffs = np.diff(timestamps)
+    # buang dt yang tidak valid / nol / negatif
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if diffs.size == 0:
+        return float("nan")
+
+    mean_dt = np.mean(diffs)
+    if (not np.isfinite(mean_dt)) or mean_dt <= 0:
+        return float("nan")
+
+    return 1.0 / mean_dt
+
 
 
 def sparc(speed_profile, fs, padlevel=4, fc=10.0, amp_th=0.05):
-    """
-    Calcualtes the smoothness of the given speed profile using the modified
-    spectral arc length metric.
+    speed_profile = np.asarray(speed_profile, dtype=float)
 
-    Parameters
-    ----------
-    speed_profile : np.array
-               The array containing the movement speed profile.
-    fs       : float
-               The sampling frequency of the data.
-    padlevel : integer, optional
-               Indicates the amount of zero padding to be done to the movement
-               data for estimating the spectral arc length. [default = 4]
-    fc       : float, optional
-               The max. cut off frequency for calculating the spectral arc
-               length metric. [default = 10.]
-    amp_th   : float, optional
-               The amplitude threshold to used for determing the cut off
-               frequency upto which the spectral arc length is to be estimated.
-               [default = 0.05]
+    # Guard: data terlalu pendek / fs tidak valid
+    if speed_profile.size < 2 or (not np.isfinite(fs)) or fs <= 0:
+        empty = (np.array([]), np.array([]))
+        return float("nan"), empty, empty
 
-    Returns
-    -------
-    sal      : float
-               The spectral arc length estimate of the given movement's
-               smoothness.
-    (f, Mf)  : tuple of two np.arrays
-               This is the frequency(f) and the magntiude spectrum(Mf) of the
-               given movement data. This spectral is from 0. to fs/2.
-    (f_sel, Mf_sel) : tuple of two np.arrays
-                      This is the portion of the spectrum that is selected for
-                      calculating the spectral arc length.
+    # Jika semua nol/flat, SPARC tidak bermakna
+    if np.nanmax(np.abs(speed_profile)) <= 0:
+        empty = (np.array([]), np.array([]))
+        return float("nan"), empty, empty
 
-    Notes
-    -----
-    This is the modfieid spectral arc length metric, which has been tested only
-    for discrete movements.
-
-    Examples
-    --------
-    >>> t = np.arange(-1, 1, 0.01)
-    >>> move = np.exp(-5*pow(t, 2))
-    >>> sal, _, _ = sparc(move, fs=100.)
-    >>> '%.5f' % sal
-    '-1.41403'
-
-    """
     # Number of zeros to be padded.
     nfft = int(pow(2, np.ceil(np.log2(len(speed_profile))) + padlevel))
 
     # Frequency
     f = np.arange(0, fs, fs / nfft)
-    # Normalized magnitude spectrum
-    Mf = abs(np.fft.fft(speed_profile, nfft))
-    Mf = Mf / max(Mf)
 
-    # Indices to choose only the spectrum within the given cut off frequency
-    # Fc.
-    # NOTE: This is a low pass filtering operation to get rid of high frequency
-    # noise from affecting the next step (amplitude threshold based cut off for
-    # arc length calculation).
-    fc_inx = ((f <= fc) * 1).nonzero()
-    f_sel = f[fc_inx]
-    Mf_sel = Mf[fc_inx]
+    # Magnitude spectrum
+    Mf = np.abs(np.fft.fft(speed_profile, nfft))
+    den = np.nanmax(Mf) if Mf.size else 0.0
+    if (not np.isfinite(den)) or den <= 0:
+        return float("nan"), (f, Mf), (np.array([]), np.array([]))
+    Mf = Mf / den
 
-    # Choose the amplitude threshold based cut off frequency.
-    # Index of the last point on the magnitude spectrum that is greater than
-    # or equal to the amplitude threshold.
-    inx = ((Mf_sel >= amp_th) * 1).nonzero()[0]
-    fc_inx = range(inx[0], inx[-1] + 1)
-    f_sel = f_sel[fc_inx]
-    Mf_sel = Mf_sel[fc_inx]
+    # Low-pass selection
+    fc_mask = f <= fc
+    f_sel = f[fc_mask]
+    Mf_sel = Mf[fc_mask]
+    if f_sel.size < 2:
+        return float("nan"), (f, Mf), (f_sel, Mf_sel)
 
-    # Calculate arc length
-    new_sal = -sum(np.sqrt(pow(np.diff(f_sel) / (f_sel[-1] - f_sel[0]), 2) + pow(np.diff(Mf_sel), 2)))
+    # Threshold selection
+    inx = np.nonzero(Mf_sel >= amp_th)[0]
+    if inx.size == 0:
+        return float("nan"), (f, Mf), (f_sel, Mf_sel)
+
+    f_sel = f_sel[inx[0] : inx[-1] + 1]
+    Mf_sel = Mf_sel[inx[0] : inx[-1] + 1]
+    if f_sel.size < 2:
+        return float("nan"), (f, Mf), (f_sel, Mf_sel)
+
+    denom = (f_sel[-1] - f_sel[0])
+    if denom <= 0 or (not np.isfinite(denom)):
+        return float("nan"), (f, Mf), (f_sel, Mf_sel)
+
+    new_sal = -np.sum(
+        np.sqrt((np.diff(f_sel) / denom) ** 2 + (np.diff(Mf_sel)) ** 2)
+    )
     return new_sal, (f, Mf), (f_sel, Mf_sel)
 
 
