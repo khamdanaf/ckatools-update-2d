@@ -44,50 +44,35 @@ def main() -> int:
 
     return 0
 
-RAWPATHS_COLS = {
-    "Player", "Level", "Pair_Label", "From", "To", "Seq", "X", "Y", "Timestamp"
-}
+# --- RawPaths (2D) adapter: make CKATool accept your CSV without changing it ---
+RAWPATHS_COLS = {"Player", "Level", "Pair_Label", "From", "To", "Seq", "X", "Y", "Timestamp"}
 
-def _convert_rawpaths_to_ckatool_df(df: pl.DataFrame, tail_n: int = 5) -> pl.DataFrame:
-    scale = 0.01      # kalau gerak kekecilan: 0.05 ; kalau terlalu besar: 0.001
-    iter_gap = 2.0    # detik jeda antar iteration biar timeline tidak tumpang tindih
-
+def _convert_rawpaths_to_ckatool_df(df: pl.DataFrame, *, scale: float = 0.01) -> pl.DataFrame:
+    # 1) mapping 2D -> 3D (Z=0), rapikan time supaya bisa dianimasikan
     df2 = (
         df.with_columns(
             pl.col("Seq").cast(pl.Int32).alias("iteration"),
-            pl.col("Timestamp").cast(pl.Float64).alias("timestamp"),
-            # center + scale (biar objek dekat origin & kelihatan)
+            (pl.col("Timestamp").cast(pl.Float64) - pl.col("Timestamp").min()).alias("timestamp"),
             ((pl.col("X").cast(pl.Float64) - pl.col("X").mean()) * scale).alias("end_effector_x"),
             ((-(pl.col("Y").cast(pl.Float64) - pl.col("Y").mean())) * scale).alias("end_effector_y"),
             pl.lit(0.0).alias("end_effector_z"),
         )
         .select(["iteration", "timestamp", "end_effector_x", "end_effector_y", "end_effector_z"])
-        .sort(["iteration", "timestamp"])
-        .with_columns(
-            # timestamp mulai dari 0 per iteration + digeser agar antar iteration tidak numpuk
-            (
-                (pl.col("timestamp") - pl.col("timestamp").min().over("iteration"))
-                + (pl.col("iteration") - 1) * iter_gap
-            ).alias("timestamp")
-        )
+        .sort(["timestamp"])
     )
 
+    # 2) target = rata-rata beberapa titik terakhir per iteration
     targets = (
         df2.group_by("iteration")
         .agg(
-            pl.col("end_effector_x").tail(tail_n).mean().alias("target_x"),
-            pl.col("end_effector_y").tail(tail_n).mean().alias("target_y"),
+            pl.col("end_effector_x").tail(5).mean().alias("target_x"),
+            pl.col("end_effector_y").tail(5).mean().alias("target_y"),
         )
         .with_columns(pl.lit(0.0).alias("target_z"))
     )
     df2 = df2.join(targets, on="iteration", how="left")
 
-    # joint dummy (offset) -> ikut diskalakan biar proporsional
-    shoulder_dx, shoulder_dy = -120.0 * scale, -40.0 * scale
-    elbow_dx, elbow_dy = -60.0 * scale, -20.0 * scale
-    neck_dx, neck_dy = -115.0 * scale, -120.0 * scale
-    hip_dx, hip_dy = -130.0 * scale, 80.0 * scale
-
+    # 3) dummy joints (biar objek 3D scene ada “badan”-nya)
     def pt(prefix: str, dx: float, dy: float) -> list[pl.Expr]:
         return [
             (pl.col("end_effector_x") + dx).alias(f"{prefix}_x"),
@@ -96,24 +81,22 @@ def _convert_rawpaths_to_ckatool_df(df: pl.DataFrame, tail_n: int = 5) -> pl.Dat
         ]
 
     return df2.with_columns(
-        *pt("left_shoulder", shoulder_dx, shoulder_dy),
-        *pt("right_shoulder", shoulder_dx, shoulder_dy),
-        *pt("left_elbow", elbow_dx, elbow_dy),
-        *pt("right_elbow", elbow_dx, elbow_dy),
+        *pt("left_shoulder", -1.2, -0.4),
+        *pt("right_shoulder", -1.2, -0.4),
+        *pt("left_elbow", -0.6, -0.2),
+        *pt("right_elbow", -0.6, -0.2),
         *pt("left_wrist", 0.0, 0.0),
         *pt("right_wrist", 0.0, 0.0),
-        *pt("neck", neck_dx, neck_dy),
-        *pt("hip", hip_dx, hip_dy),
+        *pt("neck", -1.15, -1.2),
+        *pt("hip", -1.3, 0.8),
     )
 
-
 def _read_input_flexible(input_file: str) -> pl.DataFrame:
-    df = pl.read_csv(input_file)
+    df = pl.read_csv(input_file, encoding="utf8-lossy")
     if RAWPATHS_COLS.issubset(set(df.columns)):
-        return _convert_rawpaths_to_ckatool_df(df, tail_n=5)
+        return _convert_rawpaths_to_ckatool_df(df)
     # kalau sudah format asli CKATool
     return pl.read_csv(input_file, schema_overrides={"iteration": pl.Int32})
-
 
 
 class Visualiser:
@@ -267,40 +250,14 @@ class Visualiser:
             target.visualise_3d_data()
         if end_effector:
             end_effector.visualise_3d_data()
-
-            # === DOT bergerak di Trajectory ===
-            dfm = self._df.select(
-                ["timestamp", "end_effector_x", "end_effector_y", "end_effector_z"]
-            ).sort("timestamp")
-
-            pts = np.stack(
-                [
-                    dfm["end_effector_x"].to_numpy(),
-                    dfm["end_effector_y"].to_numpy(),
-                    dfm["end_effector_z"].to_numpy(),
-                ],
-                axis=1,
-            ).astype(np.float32)
-
-            step = 1  # kalau berat/lemot, coba 2 / 5 / 10
-
-            for i in range(0, len(pts), step):
-                rr.set_time_sequence("frame", i)  # bikin animasi frame-by-frame
-                rr.log("trajectory/dot", rr.Points3D(pts[i : i + 1], radii=0.05))
-            # === END DOT bergerak ===
-
             end_effector.calculate_target_error_distance(target)
             end_effector.calculate_hand_path_ratio(target)
             visualise_barchart_per_iteration(
-                end_effector.target_error_distance, ts, iteration,
-                "target_error_distance", "", end_effector.object_name
+                end_effector.target_error_distance, ts, iteration, "target_error_distance", "", end_effector.object_name
             )
             visualise_barchart_per_iteration(
-                end_effector.hand_path_ratio, ts, iteration,
-                "hand_path_ratio", "", end_effector.object_name
+                end_effector.hand_path_ratio, ts, iteration, "hand_path_ratio", "", end_effector.object_name
             )
-
-
 
         visualise_max_angle(
             right_shoulder,
